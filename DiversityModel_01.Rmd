@@ -1,0 +1,1907 @@
+---
+title: "MIRA Diversity Modeling"
+author: "Erik Clarke"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library(here)
+  library(phyloseq)
+  library(tidyverse)
+  library(stringr)
+  library(magrittr)
+  library(rstan)
+  library(tidybayes)
+})
+source(here("shared_functions.R"))
+source(here("data_generation.R"))
+source(here("betancourt_utils.R"))
+```
+
+```{r}
+mira.phyloseq <- load_mira_phyloseq(rarefy_depth = 1000)
+agg <- prepare_data(mira.phyloseq$mira.abx, mira.phyloseq$meds, max_lag=7)
+diversities <- agg %>% 
+  filter(read_count > 0) %>%
+  group_by(specimen_id2, subject_id, specimen_type, study_day) %>%
+  summarize(D1 = exp(-sum((read_count/total_reads) * log(read_count/total_reads)))) %>%
+  group_by(subject_id, specimen_type) %>%
+  filter(study_day == min(study_day)) %>%
+  ungroup() %>%
+  select(subject_id, specimen_type, D1_start=D1)
+```
+
+# Diversity overview
+
+```{r}
+all_diversities <- agg %>%
+  filter(read_count > 0) %>%
+  group_by(specimen_id2, subject_id, specimen_type, study_day) %>%
+  summarize(D1 = exp(-sum((read_count/total_reads) * log(read_count/total_reads))))
+ggplot(all_diversities, aes(x=study_day, y=D1, color=specimen_type)) +
+  geom_line() +
+  facet_wrap(vars(subject_id), scales="free")
+```
+
+
+# Dominant taxa
+
+```{r}
+gpgn <- read_csv("dominant_day0_gpgn.csv") %>%
+  rename(Genus = dominant_genus)
+starting_stain_props <- agg %>% 
+  filter(read_count > 0) %>%
+  group_by(specimen_id2, total_reads, Genus) %>%
+  summarize(genus_reads = sum(read_count)) %>%
+  mutate(genus_prop = genus_reads / total_reads) %>%
+  left_join(gpgn) %>%
+  group_by(specimen_id2, stain) %>%
+  summarize(stain_prop = sum(genus_prop)) %>%
+  left_join(distinct(agg, specimen_id2, specimen_type, subject_id, study_day)) %>%
+  group_by(subject_id, specimen_type) %>%
+  filter(study_day == min(study_day)) %>%
+  ungroup() %>%
+  select(stain, stain_prop, subjects=subject_id, study_day, specimen_type) %>%
+  complete(subjects, specimen_type, stain, fill=list(stain_prop=0))
+  
+```
+
+# Starting Staph
+
+```{r}
+starting_staph_props <- agg %>%
+  filter(read_count > 0, Genus == "Staphylococcus") %>%
+  group_by(specimen_id2, total_reads) %>%
+  summarize(staph_reads = sum(read_count)) %>%
+  mutate(staph_prop = staph_reads/total_reads) %>%
+  left_join(distinct(agg, specimen_id2, specimen_type, subject_id, study_day)) %>%
+  group_by(subject_id, specimen_type) %>%
+  filter(study_day == min(study_day)) %>%
+  ungroup() %>%
+  select(staph_prop, subjects=subject_id, study_day, specimen_type)
+```
+
+
+# Table summaries
+
+```{r}
+agg %>% group_by(specimen_type) %>% 
+  summarize(
+    subjects = n_distinct(subject_id),
+    specimens = n_distinct(specimen_id2))
+n_distinct(agg$specimen_id2)
+agg %>% 
+  filter(!is.na(specimen_type)) %>%
+  group_by(specimen_type, subject_id) %>%
+  summarize(duration = max(study_day)) %>%
+  # filter(duration > 0) %>%
+  summarize(
+    min_duration = min(duration),
+    med_duration = median(duration),
+    iqr_duration = IQR(duration))
+agg %>% select(subject_id, specimen_type, study_day, abx_lagged) %>%
+  distinct(subject_id, specimen_type, study_day, .keep_all = T) %>%
+  unnest() %>%
+  filter(day_lag == 0, study_day > 0) %>%
+  group_by(specimen_type, study_day) %>%
+  # filter(subject_id == "MIRA_001") %>%
+  summarize(abx_num = sum(!is.na(abx_b))) %>%
+  summarize(
+    med_abx_no = median(abx_num),
+    iqr_abx_no = IQR(abx_num))
+
+```
+
+
+# Model 3
+
+## Model 3.0
+
+```{r}
+d300 <- gen3.01(agg, "Sputum", min_times_abx = 4, max_lag=1)
+m300 <- stan(
+  "div_3.0.stan", data=d300, cores=4, iter=5000,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+```
+
+Model 3.0 doesn't work that well, with a large number of divergent iterations and high Rhat values.
+
+## Model 3.1
+
+Let's reparameterize to centered and remove some of the terms.
+
+```{r}
+m310 <- stan(
+  "div_3.1.stan", data=d300, cores=4, iter=10000,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m310, "fit_div_3.1.rds")
+```
+
+Still a high number of divergences.
+
+## Model 3.2
+
+Do we need specimen-level intercepts?
+
+```{r}
+m320 <-  stan(
+  "div_3.2.stan", data=d300, cores=4, iter=5000,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m310, "fit_div_3.2.rds")
+```
+
+This has only a few divergences (3/5000) and no high Rhat values or other pathologies.
+
+```{r}
+m320 %>%
+  recover_types(d300$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag]) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d300$abx)[abx]) %>%
+  ggplot(aes(b_abx2, y=as.factor(abx), color=as.factor(days_lag))) +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  stat_pointintervalh(alpha=0.4, show.legend=T) +
+  facet_wrap(vars(subjects), scales="free")
+```
+
+```{r}
+m320 %>%
+  recover_types(d300$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag]) %>%
+  mutate(with_abx = a + a_subj + b_abx2) %>%
+  mutate(without_abx = a + a_subj) %>%
+  mutate(difference = with_abx - without_abx) %>%
+  ggplot(aes(difference, y=as.factor(abx), color=as.factor(days_lag))) +
+  geom_vline(aes(xintercept=0), linetype="dashed") +
+  stat_pointintervalh(alpha=0.4, show.legend=T, .width = 0.5) +
+  facet_wrap(vars(subjects), scales="free")
+```
+
+Let's try it with more data:
+
+```{r}
+d321 <- gen3.01(agg, "Sputum", min_times_abx = 2, max_lag=4)
+m321 <-  stan(
+  "div_3.2.stan", data=d321, cores=4, iter=5000,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m321, "fit_div_3.2.1.rds")
+```
+
+```{r}
+m321 %>%
+  recover_types(d321$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2)) %>%
+  mutate(without_abx = exp(a + a_subj)) %>%
+  mutate(difference = with_abx-without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d321$abx)[abx]) %>%
+  ggplot(aes(as.factor(days_lag-1), y=difference, group=subjects)) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free")
+```
+
+```{r}
+d321$d5 %>%
+  filter(day_lag==0) %>%
+  ggplot(aes(study_day, D1_delta)) +
+  geom_point() +
+  geom_hline(aes(yintercept=1))
+```
+
+## Model 3.3 
+
+The D1_delta variable is hard to interpret as a ratio. We should change it to a difference or just model D1 directly with a lag term.
+
+For this model, let's just model it directly.
+
+```{r}
+d330 <- gen3.02(agg, "Sputum", min_times_abx = 2, max_lag=4)
+m330 <-  stan(
+  "div_3.3.stan", data=d330, cores=4, iter=5000,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+```
+
+```{r}
+s330 <- m330 %>%
+  recover_types(d330$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d330$abx)[abx])
+
+ggplot(s330, aes(as.factor(days_lag-1), y=difference, group=subjects, color=days_lag-1)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free") +
+  theme_bw() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(
+    x="Days since abx. administration", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_v3.3.pdf", width=8, height=6)
+```
+
+
+## Model 3.4 
+
+What happens if we relax the pooling a bit?
+
+```{r}
+m340 <-  stan(
+  "div_3.4.stan", data=d330, cores=4, iter=5000,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m340, "fit_div_3.4.rds")
+m340 <- readRDS("fit_div_3.4.rds")
+```
+
+```{r}
+s340 <- m340 %>%
+  recover_types(d330$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d330$abx)[abx])
+
+ggplot(s340, aes(as.factor(days_lag-1), y=difference, group=subjects, color=days_lag-1)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free") +
+  theme_bw() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(
+    x="Days since abx. administration", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic (relaxed priors)",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_v3.4.pdf", width=8, height=6)
+```
+
+### Stool
+
+```{r}
+d331 <- gen3.02(agg, "Stool Swab", min_times_abx = 2, max_lag=4)
+m340.stool <-  stan(
+  "div_3.4.stan", data=d331, cores=3, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+```
+
+```{r}
+s340.stool <- m340.stool %>%
+  recover_types(d331$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d331$abx)[abx])
+
+ggplot(s340.stool, aes(as.factor(days_lag-1), y=difference, group=subjects, color=days_lag-1)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free") +
+  theme_bw() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(
+    x="Days since abx. administration", y="Change in diversity",
+    title="Change in stool diversity due to antibiotic (relaxed priors)",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+### Oral
+
+```{r}
+d332 <- gen3.02(agg, "Oral Swab", min_times_abx = 2, max_lag=4)
+m340.oral <-  stan(
+  "div_3.4.stan", data=d332, cores=3, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+```
+
+```{r}
+s340.oral <- m340.oral %>%
+  recover_types(d332$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d332$abx)[abx])
+
+ggplot(s340.oral, aes(as.factor(days_lag-1), y=difference, group=subjects, color=days_lag-1)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free") +
+  theme_bw() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(
+    x="Days since abx. administration", y="Change in diversity",
+    title="Change in oral diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+### Extended days
+
+Let's now try with longer administration periods.
+
+```{r}
+d340.sp <- gen3.02(agg, "Sputum", min_times_abx = 2, max_lag=7)
+m340.sp <-  stan(
+  "div_3.4.stan", data=d340.sp, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+```
+
+```{r}
+s340.sp <- m340.sp %>%
+  recover_types(d340.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d340.sp$abx)[abx])
+
+ggplot(s340.sp, aes(as.factor(days_lag-1), y=difference, group=subjects, color=days_lag-1)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free") +
+  theme_bw() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(
+    x="Days since abx. administration", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic (relaxed priors)",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_v3.4.pdf", width=8, height=6)
+```
+
+## Model 3.5
+
+Rather than just "abx x days ago" we'll now have indicators for that abx
+at that timepoint for varying lengths of continuous administration.
+
+### Sputum
+
+```{r}
+d350.sp <- gen3.03(agg, 'Sputum', min_times_abx = 8, max_continuous = 4)
+m350.sp <-  stan(
+  "div_3.5.stan", data=d350.sp, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+m350.sp <- readRDS()
+check_all_diagnostics(m350.sp)
+```
+
+```{r}
+s350.sp <- m350.sp %>%
+  recover_types(d350.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, days_lag], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d350.sp$abx)[abx])
+
+ggplot(s350.sp, aes(as.factor(days_lag), y=difference, group=subjects, color=days_lag-1)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx), scales="free") +
+  theme_bw() +
+  scale_y_continuous(labels=scales::percent) +
+  scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_v3.5.pdf", width=8, height=4)
+```
+
+There's a LOT of variance in the 5+ day window. What if we don't aggregate like that?
+
+```{r}
+d351.sp <- gen3.03(agg, 'Sputum', min_times_abx = 8, max_continuous = 10)
+m351.sp <-  stan(
+  "div_3.5.stan", data=d351.sp, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m351.sp, "fit_div_3.5.sputum.rds")
+m351.sp <- readRDS("fit_div_3.5.sputum.rds")
+check_all_diagnostics(m351.sp)
+```
+
+```{r}
+s351.sp <- m351.sp %>%
+  recover_types(d351.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d351.sp$abx)[abx_lag])
+
+s351.sp1 <- d351.sp$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s351.sp, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s351.sp1, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_Extended_v3.5.pdf", width=8, height=4)
+```
+
+This looks good. We have a decrease in diversity especially on days 5-8 for this limited set of abx.
+
+#### By Day0 D1
+```{r}
+s351.sp2 <- diversities %>%
+  filter(specimen_type == "Sputum") %>%
+  right_join(d351.sp$d5, by=c("subject_id"="subjects")) %>%
+  select(subjects=subject_id, D1_start) %>%
+  distinct(subjects, D1_start) %>%
+  right_join(s351.sp1) %>%
+  filter(abx_lag == "cefepime")
+ggplot(s351.sp2, aes(x=D1_start, y=difference, ymin=difference.lower, ymax=difference.upper)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.2, 0.5), show.legend = T) +
+  facet_wrap(vars(continuous), scales="free_x") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+#### By Day0 GP/GN
+
+```{r}
+s351.sp3 <- starting_stain_props %>%
+  filter(specimen_type == "Sputum") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d351.sp$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s351.sp1) %>%
+  filter(stain == "GN") 
+ggplot(s351.sp3, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    size_range = c(0.2, 0.5), show.legend = T,
+    position=position_dodge(width=0.8)) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="Continuous days of abx administration",
+    color="% GN bacteria at start",     
+    caption="Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_v3.5.pdf", width=8, height=3)
+
+ggplot(s351.sp3, aes(
+  x=stain_prop, y=difference, ymin=difference.lower, ymax=difference.upper, 
+  group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.2, 0.5)) +
+  scale_x_continuous(labels=scales::percent, breaks = c(0.1, 0.5, 0.9)) +
+  facet_grid(rows=vars(abx_lag), cols=vars(continuous), scales="free_y") +
+  # scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="% GN bacteria at start",
+    caption="Columns are days of continuous abx exposure. Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_Biplots_v3.5.pdf", width=8, height=4)
+
+ggplot(s351.sp3, aes(
+  x=stain_prop, y=difference, ymin=difference.lower, ymax=difference.upper, 
+  group=subjects, color=abx_lag)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.5, 0.5), show.legend = T) +
+  scale_x_continuous(labels=scales::percent, breaks = c(0.1, 0.5, 0.9)) +
+  # facet_grid(rows=vars(abx_lag), cols=vars(continuous), scales="free_y") +
+  # scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="% GN bacteria at start",
+    caption="Columns are days of continuous abx exposure. Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_Biplot_v3.5.pdf", width=6, height=4)
+```
+
+
+### Stool
+
+```{r}
+d350.st <- gen3.03(agg, 'Stool Swab', min_times_abx = 5, max_continuous = 10)
+m350.st <-  stan(
+  "div_3.5.stan", data=d350.st, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m350.st, "fit_div_3.5.stool.rds")
+m350.st <- readRDS("fit_div_3.5.stool.rds")
+check_all_diagnostics(m351.sp)
+```
+
+```{r}
+s350.st <- m350.st %>%
+  recover_types(d350.st$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d350.st$abx)[abx])
+
+# add marker for whether a subject was observed at this combo or not
+s350.st1 <- d350.st$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s350.st, by=c("subjects", "abx_lag"="abx", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s350.st1, aes(
+    as.factor(continuous), y=difference, group=subjects, color=continuous,
+    alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in stool diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+#### By Day0 Genera
+
+```{r}
+s350.st3 <- dominant_taxa %>%
+  filter(specimen_type == "Stool Swab") %>%
+  right_join(d350.st$d5) %>%
+  distinct(subjects, dominant_genus, dom_genus_prop) %>%
+  right_join(s350.st1)
+ggplot(s350.st3, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, color=dominant_genus, group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    size_range = c(0.2, 0.5), show.legend = T,
+    position=position_dodge(width=0.8)) +
+  facet_wrap(vars(abx_lag), scales="free_x") +
+  theme_bw() +
+  theme(aspect.ratio = 1)
+```
+
+### Oral
+
+```{r}
+d350.os <- gen3.03(agg, 'Oral Swab', min_times_abx = 5, max_continuous = 10)
+m350.os <-  stan(
+  "div_3.5.stan", data=d350.os, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m350.st, "fit_div_3.5.stool.rds")
+
+check_all_diagnostics(m351.sp)
+```
+
+```{r}
+s350.os <- m350.os %>%
+  recover_types(d350.os$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx=colnames(d350.os$abx)[abx])
+
+# add marker for whether a subject was observed at this combo or not
+s350.os1 <- d350.os$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s350.os, by=c("subjects", "abx_lag"="abx", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s350.os1, aes(
+    as.factor(continuous), y=difference, group=subjects, color=continuous,
+    alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in oral diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+## Model 3.6
+
+We're going to separate by subjects that have high Pseudomonas and those with low Pseudomonas.
+
+### Sputum
+
+#### High Ps.
+
+```{r}
+d360.sp.pdom <- gen3.03(
+  filter(agg, dominant_taxa == "Pseudomonas"), "Sputum",  max_continuous = 10)
+m360.sp.pdom <-  stan(
+  "div_3.5.stan", data=d360.sp.pdom, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18, stepsize=1))
+check_all_diagnostics(m360.sp.pdom)
+```
+
+```{r}
+s360.sp.pdom <- m360.sp.pdom %>%
+  recover_types(d360.sp.pdom$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d360.sp.pdom$abx)[abx_lag])
+
+s360.sp.pdom <- d360.sp.pdom$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s360.sp.pdom, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s360.sp.pdom, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+#### Low Ps.
+
+```{r}
+d360.sp.plite <- gen3.03(
+  filter(agg, is.na(dominant_taxa) | dominant_taxa != "Pseudomonas"), "Sputum",  max_continuous = 10)
+m360.sp.plite<-  stan(
+  "div_3.5.stan", data=d360.sp.plite, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.95, max_treedepth=18))
+check_all_diagnostics(m360.sp.plite)
+```
+
+```{r}
+s360.sp.plite <- m360.sp.plite %>%
+  recover_types(d360.sp.plite$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d360.sp.plite$abx)[abx_lag])
+
+s360.sp.plite <- d360.sp.plite$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s360.sp.plite, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed, abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv", "amoxicillin.clavulanate"))
+
+ggplot(s360.sp.plite, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic (low Pseudomonas subjects)",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+
+## Model 3.7
+
+Using much more flexible priors here.
+
+### Sputum
+
+```{r}
+d370.sp <- gen3.03(agg, 'Sputum', min_times_abx = 8, max_continuous = 10)
+m370.sp <-  stan(
+  "div_3.7.stan", data=d370.sp, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m370.sp, "fit_div_3.7.sputum.rds")
+m370.sp <- readRDS("fit_div_3.7.sputum.rds")
+check_all_diagnostics(m370.sp)
+```
+
+```{r}
+s370.sp <- m370.sp %>%
+  recover_types(d370.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d370.sp$abx)[abx_lag])
+
+s370.sp1 <- d370.sp$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s370.sp, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s370.sp1, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_Extended_v3.7.pdf", width=8, height=4)
+```
+
+```{r}
+s370.sp3 <- starting_stain_props %>%
+  filter(specimen_type == "Sputum") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d370.sp$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s370.sp1) %>%
+  filter(stain == "GN") %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+ggplot(s370.sp3, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    size_range = c(0.2, 0.5), show.legend = T,
+    position=position_dodge(width=0.8)) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent, 
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start")
+ggsave("Sputum_Delta_Diversity_GPGN_v3.7.pdf", width=8, height=3.5)
+
+ggplot(s370.sp3, aes(
+  x=stain_prop, y=difference, ymin=difference.lower, ymax=difference.upper, 
+  group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.2, 0.5)) +
+  scale_x_continuous(labels=scales::percent, breaks = c(0.1, 0.5, 0.9)) +
+  facet_grid(rows=vars(abx_lag), cols=vars(continuous), scales="free_y") +
+  # scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="% GN bacteria at start",
+    caption="Columns are days of continuous abx exposure. Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_Biplots_v3.7.pdf", width=8, height=4)
+
+ggplot(s370.sp3, aes(
+  x=stain_prop, y=difference, ymin=difference.lower, ymax=difference.upper, 
+  group=subjects, color=abx_lag)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.5, 0.5), show.legend = T) +
+  scale_x_continuous(labels=scales::percent, breaks = c(0.1, 0.5, 0.9)) +
+  # facet_grid(rows=vars(abx_lag), cols=vars(continuous), scales="free_y") +
+  # scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="% GN bacteria at start",
+    caption="Columns are days of continuous abx exposure. Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_Biplot_v3.7.pdf", width=6, height=4)
+```
+
+#### New PPI
+
+We may be calculating the posterior predictive intervals incorrectly.
+
+```{r}
+s371.sp <- m370.sp %>%
+  recover_types(d370.sp$d_abx) %>%
+  spread_draws(
+    a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], 
+    b_abx_agg[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx_agg + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d370.sp$abx)[abx_lag])
+
+s371.sp1 <- d370.sp$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s371.sp, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s371.sp1, aes(    
+  as.factor(continuous), y=b_abx_agg, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=b_abx_agg.lower, ymax=b_abx_agg.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+  
+
+```
+
+
+
+### Stool
+
+```{r}
+d370.st <- gen3.03(agg, 'Stool Swab', min_times_abx = 4, max_continuous = 10)
+m370.st <-  stan(
+  "div_3.7.stan", data=d370.st, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m370.sp, "fit_div_3.7.stool.rds")
+check_all_diagnostics(m370.st)
+```
+
+```{r}
+s370.sp <- m370.sp %>%
+  recover_types(d370.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d370.sp$abx)[abx_lag])
+
+s370.sp1 <- d370.sp$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s370.sp, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s370.sp1, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_Extended_v3.7.pdf", width=8, height=4)
+```
+
+```{r}
+s370.sp3 <- starting_stain_props %>%
+  filter(specimen_type == "Sputum") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d370.sp$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s370.sp1) %>%
+  filter(stain == "GN") %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+ggplot(s370.sp3, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    size_range = c(0.2, 0.5), show.legend = T,
+    position=position_dodge(width=0.8)) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent, 
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start")
+ggsave("Sputum_Delta_Diversity_GPGN_v3.7.pdf", width=8, height=3.5)
+
+ggplot(s370.sp3, aes(
+  x=stain_prop, y=difference, ymin=difference.lower, ymax=difference.upper, 
+  group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.2, 0.5)) +
+  scale_x_continuous(labels=scales::percent, breaks = c(0.1, 0.5, 0.9)) +
+  facet_grid(rows=vars(abx_lag), cols=vars(continuous), scales="free_y") +
+  # scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="% GN bacteria at start",
+    caption="Columns are days of continuous abx exposure. Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_Biplots_v3.7.pdf", width=8, height=4)
+
+ggplot(s370.sp3, aes(
+  x=stain_prop, y=difference, ymin=difference.lower, ymax=difference.upper, 
+  group=subjects, color=abx_lag)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(size_range = c(0.5, 0.5), show.legend = T) +
+  scale_x_continuous(labels=scales::percent, breaks = c(0.1, 0.5, 0.9)) +
+  # facet_grid(rows=vars(abx_lag), cols=vars(continuous), scales="free_y") +
+  # scale_color_gradient2(midpoint=0.5, labels=scales::percent) +
+  theme_bw() +
+  labs(
+    title="Change in bacterial diversity in sputum",
+    y = "Change in diversity", x="% GN bacteria at start",
+    caption="Columns are days of continuous abx exposure. Median posterior estimate with 50% probability interval")
+ggsave("Sputum_Delta_Diversity_GPGN_Biplot_v3.7.pdf", width=6, height=4)
+```
+
+#### New PPI
+
+
+```{r}
+s371.st <- m370.st %>%
+  recover_types(d370.st$d_abx) %>%
+  spread_draws(
+    a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], 
+    b_abx_agg[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx_agg + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx-without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d370.st$abx)[abx_lag])
+
+s371.st1 <- d370.st$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s371.st, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s371.st1, aes(    
+  as.factor(continuous), y=b_abx_agg, group=subjects, color=continuous,
+  alpha=observed)) +
+  geom_hline(aes(yintercept=0), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=b_abx_agg.lower, ymax=b_abx_agg.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in stool diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+  
+
+```
+
+
+### Sputum
+
+```{r}
+d370.os <- gen3.03(agg, 'Oral Swab', min_times_abx = 4, max_continuous = 10)
+m370.os <-  stan(
+  "div_3.7.stan", data=d370.os, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m370.os, "fit_div_3.7.oral.rds")
+m370.os <- readRDS("fit_div_3.7.oral.rds")
+check_all_diagnostics(m370.os)
+```
+
+#### New PPI
+
+
+```{r}
+s371.os <- m370.os %>%
+  recover_types(d370.os$d_abx) %>%
+  spread_draws(
+    a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], 
+    b_abx_agg[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d370.os$abx)[abx_lag])
+
+s371.os1 <- d370.os$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s371.os, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s371.os1, aes(    
+  as.factor(continuous), y=exp(b_abx_agg), group=subjects, color=continuous)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_point(position=position_dodge(0.8)) +
+  geom_line(position=position_dodge(0.8)) +
+  # geom_pointinterval(
+  #   aes(ymin=exp(b_abx2.lower), ymax=difference.upper),
+  #   position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in oral diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+```
+
+## Model 3.8
+
+We'd like to introduce a term to capture extremely extended-duration antibiotic courses
+as well as partially pool between lag terms for the same subject and antibiotic.
+
+### Sputum
+
+```{r}
+d380.sp <- gen3.03(agg_ext, "Sputum", max_continuous = 9)
+m380.sp <-  stan(
+  "div_3.8.stan", data=d380.sp, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m380.sp, "fit_div_3.8.sputum.rds")
+# m380.sp <- readRDS("fit_div_3.8.sputum.rds")
+check_all_diagnostics(m380.sp)
+```
+
+```{r}
+s380.sp <- m380.sp %>%
+  recover_types(d380.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d380.sp$abx)[abx_lag])
+
+s380.sp1 <- d380.sp$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s380.sp, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)
+
+ggplot(s380.sp1, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in sputum diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Sputum_Delta_Diversity_Extended_v3.8.pdf", width=8, height=4)
+```
+
+```{r}
+s380.sp3 <- starting_stain_props %>%
+  filter(specimen_type == "Sputum") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d380.sp$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s380.sp1) %>%
+  filter(stain == "GN", abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s380.sp3, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects, fill=stain_prop)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7, size=0.8) +
+  geom_line(position=.pos, size=1) +
+  geom_point(position=.pos, shape=21, size=5, color="black") +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  # scale_color_viridis_c(
+  #   option = "E", direction = 1, end = 0.75,
+  #   labels=scales::percent,
+  #   breaks = c(0.1, 0.5, 0.9),
+  #   guide = guide_colorbar(
+  #   title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  # scale_color_gradientn(
+  #   colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+  #   labels=scales::percent,
+  #   breaks = c(0.1, 0.5, 0.9),
+  #   guide = guide_colorbar(
+  #   title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  scale_color_gradientn(
+    colours = c("#bdc9e1", "#74a9cf", "#045a8d"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  scale_fill_gradientn(
+    colours = c("#bdc9e1", "#74a9cf", "#045a8d"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw(base_size = 26) +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start", fill="Gram-negative bacteria at start")
+ggsave("Sputum_Delta_Diversity_GPGN_v3.8.pdf", width=27, height=8)
+
+```
+ 
+
+```{r}
+s380.sp4 <- starting_staph_props %>%
+  filter(specimen_type == "Sputum") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d380.sp$d5) %>%
+  distinct(subjects, staph_prop) %>%
+  right_join(s380.sp1) %>%
+  filter(abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s380.sp4, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=staph_prop, group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7) +
+  geom_point(position=.pos) +
+  geom_line(position=.pos, size=0.8) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_continuous(
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Starting proportion of Staphylococcus")
+ggsave("Sputum_Delta_Diversity_Staph_v3.8.pdf", width=8, height=3.5)
+
+```
+ 
+ 
+### Stool
+
+```{r}
+d380.st <- gen3.03(agg_ext, "Stool Swab", min_times_abx = 3, max_continuous = 9)
+m380.st <-  stan(
+  "div_3.8.stan", data=d380.st, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m380.st, "fit_div_3.8.stool.rds")
+# m380.sp <- readRDS("fit_div_3.8.sputum.rds")
+check_all_diagnostics(m380.st)
+```
+
+```{r}
+s380.st <- m380.st %>%
+  recover_types(d380.st$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d380.st$abx)[abx_lag])
+
+s380.st1 <- d380.st$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s380.st, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed) %>%
+  filter(abx_lag %in% c("cefepime", "amoxicillin.clavulanate", "vancomyciniv"))
+
+ggplot(s380.st1, aes(    
+  as.factor(continuous), y=difference, group=subjects, color=continuous)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  # geom_line(color="black", position=position_dodge(0.8)) +
+  geom_pointinterval(
+    aes(ymin=difference.lower, ymax=difference.upper), 
+    position=position_dodge(width=0.8), size_range = c(0.2, 0.5)) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  theme_bw() +
+  scale_alpha_manual(values=c("TRUE"=1, "FALSE"=0.2)) +
+  scale_y_continuous(labels=scales::percent) +
+  # scale_x_discrete(labels=c("5"="5+")) +
+  labs(
+    x="Continuous days of abx", y="Change in diversity",
+    title="Change in stool diversity due to antibiotic",
+    subtitle="Ratio of on-abx diversity over off-abx diversity",
+    caption="Median posterior estimate with 50% probability interval") 
+ggsave("Stool_Delta_Diversity_Extended_v3.8.pdf", width=8, height=4)
+```
+
+```{r}
+s380.st3 <- starting_stain_props %>%
+  filter(specimen_type == "Stool Swab") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d380.st$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s380.st1) %>%
+  filter(stain == "GN", abx_lag %in% c("cefepime", "amoxicillin.clavulanate", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "cefepime"="cefepime",
+    "amoxicillin + clavulanate"="amoxicillin.clavulanate",
+    "vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s380.st3, aes(
+    x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects, fill=stain_prop)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7, size=0.8) +
+  geom_line(position=.pos, size=1) +
+  geom_point(position=.pos, shape=21, size=5, color="black") +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  # scale_color_viridis_c(
+  #   option = "E", direction = 1, end = 0.75,
+  #   labels=scales::percent,
+  #   breaks = c(0.1, 0.5, 0.9),
+  #   guide = guide_colorbar(
+  #   title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  # scale_color_gradientn(
+  #   colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+  #   labels=scales::percent,
+  #   breaks = c(0.1, 0.5, 0.9),
+  #   guide = guide_colorbar(
+  #   title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  scale_color_gradientn(
+    colours = c("#bdc9e1", "#74a9cf", "#045a8d"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  scale_fill_gradientn(
+    colours = c("#bdc9e1", "#74a9cf", "#045a8d"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw(base_size = 26) +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start", fill="Gram-negative bacteria at start")
+ggsave("Stool_Delta_Diversity_GPGN_v3.8.pdf", width=27, height=8)
+```
+
+
+```{r}
+s380.st4 <- starting_staph_props %>%
+  filter(specimen_type == "Stool Swab") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d380.st$d5) %>%
+  distinct(subjects, staph_prop) %>%
+  right_join(s380.st1) %>%
+  # filter(abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s380.st4, aes(
+  x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=staph_prop, group=subjects)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7) +
+  geom_point(position=.pos) +
+  geom_line(position=.pos, size=0.8) +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_continuous(
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Starting proportion of Staphylococcus")
+ggsave("Stool_Delta_Diversity_Staph_v3.8.pdf", width=8, height=3.5)
+
+```
+ 
+### Oral
+
+```{r}
+d380.os <- gen3.03(agg_ext, "Oral Swab", min_times_abx = 3, max_continuous = 9)
+m380.os <-  stan(
+  "div_3.8.stan", data=d380.os, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m380.os, "fit_div_3.8.oral.rds")
+# m380.os <- readRDS("fit_div_3.8.oral.rds")
+check_all_diagnostics(m380.os)
+```
+
+```{r}
+s380.os <- m380.os %>%
+  recover_types(d380.os$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d380.os$abx)[abx_lag])
+
+s380.os1 <- d380.os$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s380.os, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)# %>%
+  # filter(abx_lag %in% c("cefepime", "amoxicillin.clavulanate", "vancomyciniv"))
+
+s380.os3 <- starting_stain_props %>%
+  filter(specimen_type == "Oral Swab") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d380.os$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s380.os1) %>%
+  filter(stain=="GN", abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s380.os3, aes(
+    x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects, fill=stain_prop)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7, size=0.8) +
+  geom_line(position=.pos, size=1) +
+  geom_point(position=.pos, shape=21, size=5, color="black") +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  # scale_color_viridis_c(
+  #   option = "E", direction = 1, end = 0.75,
+  #   labels=scales::percent,
+  #   breaks = c(0.1, 0.5, 0.9),
+  #   guide = guide_colorbar(
+  #   title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  # scale_color_gradientn(
+  #   colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+  #   labels=scales::percent,
+  #   breaks = c(0.1, 0.5, 0.9),
+  #   guide = guide_colorbar(
+  #   title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  scale_color_gradientn(
+    colours = c("#bdc9e1", "#74a9cf", "#045a8d"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  scale_fill_gradientn(
+    colours = c("#bdc9e1", "#74a9cf", "#045a8d"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw(base_size = 26) +
+  theme(
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    y = "% change in diversity", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start", fill="Gram-negative bacteria at start")
+ggsave("Oral_Delta_Diversity_GPGN_v3.8.pdf", width=27, height=8)
+```
+
+
+## Model 3.9
+
+That may have been too much pooling. Let's relax the priors a bit.
+
+
+### Sputum
+
+```{r}
+d390.sp <- gen3.03(agg_ext, "Sputum", min_times_abx = 8, max_continuous = 9)
+m390.sp <-  stan(
+  "div_3.9b.stan", data=d390.sp, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m390.sp, "fit_div_3.9.sputum.rds")
+# m390.sp <- readRDS("fit_div_3.9.sputum.rds")
+check_all_diagnostics(m390.sp)
+```
+
+```{r}
+s390.sp <- m390.sp %>%
+  recover_types(d390.sp$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d390.sp$abx)[abx_lag])
+
+s390.sp1 <- d390.sp$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s390.sp, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)# %>%
+  # filter(abx_lag %in% c("cefepime", "amoxicillin.clavulanate", "vancomyciniv"))
+
+s390.sp3 <- starting_stain_props %>%
+  filter(specimen_type == "Sputum") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d390.sp$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s390.sp1) %>%
+  filter(stain=="GN", abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s390.sp3, aes(
+    x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects, fill=stain_prop)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7, size=0.8) +
+  geom_line(position=.pos, size=1) +
+  geom_point(position=.pos, shape=21, size=5, color="black") +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 26, barheight = 1)) +
+  scale_fill_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9)) +
+  theme_bw(base_size = 26) +
+  theme(
+    plot.title = element_text(size = 36, face="bold"),
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    title="Endotracheal aspirate diversity",
+    y = "Change in diversity with abx", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start", fill="Gram-negative bacteria at start")
+ggsave("Sputum_Delta_Diversity_GPGN_v3.9.pdf", width=27, height=8)
+```
+
+### Stool
+
+```{r}
+d390.st <- gen3.03(agg_ext, "Stool Swab", min_times_abx = 3, max_continuous = 9)
+m390.st <-  stan(
+  "div_3.9b.stan", data=d390.st, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m390.st, "fit_div_3.9.stool.rds")
+# m390.st <- readRDS("fit_div_3.9.stool.rds")
+check_all_diagnostics(m390.st)
+```
+
+```{r}
+s390.st <- m390.st %>%
+  recover_types(d390.st$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d390.st$abx)[abx_lag])
+
+s390.st1 <- d390.st$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s390.st, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)# %>%
+  # filter(abx_lag %in% c("cefepime", "amoxicillin.clavulanate", "vancomyciniv"))
+
+s390.st3 <- starting_stain_props %>%
+  filter(specimen_type == "Stool Swab") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d390.st$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s390.st1) %>%
+  filter(stain=="GN", abx_lag %in%  c("cefepime", "amoxicillin.clavulanate", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Amoxicillin/Clavulanate"="amoxicillin.clavulanate",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s390.st3, aes(
+    x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects, fill=stain_prop)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7, size=0.8) +
+  geom_line(position=.pos, size=1) +
+  geom_point(position=.pos, shape=21, size=5, color="black") +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 26, barheight = 1)) +
+  scale_fill_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw(base_size = 26) +
+  theme(
+    plot.title = element_text(size = 36, face="bold"),
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    title="Stool diversity",
+    y = "Change in diversity with abx", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start", fill="Gram-negative bacteria at start")
+ggsave("Stool_Delta_Diversity_GPGN_v3.9.pdf", width=27, height=8)
+```
+
+### Oral
+
+#### Fit
+
+```{r}
+d390.os <- gen3.03(agg_ext, "Oral Swab", min_times_abx = 5, max_continuous = 9)
+m390.os <-  stan(
+  "div_3.9b.stan", data=d390.os, cores=4, iter=5000, chains=4,
+  control=list(adapt_delta=0.99, max_treedepth=18))
+saveRDS(m390.os, "fit_div_3.9.oral.rds")
+# m390.os <- readRDS("fit_div_3.9.oral.rds")
+check_all_diagnostics(m390.os)
+```
+
+#### GN Plot
+
+```{r}
+s390.os <- m390.os %>%
+  recover_types(d390.os$d_abx) %>%
+  spread_draws(a, a_subj[subjects], b_abx2[subjects, abx_lag, continuous], b_lag, sigma) %>%
+  mutate(with_abx = exp(a + a_subj + b_abx2 + b_lag*3)) %>%
+  mutate(without_abx = exp(a + a_subj + b_lag*3)) %>%
+  mutate(difference = with_abx/without_abx) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d390.os$abx)[abx_lag])
+
+s390.os1 <- d390.os$d5 %>%
+  group_by(abx_lag, continuous) %>%
+  distinct(subjects) %>%
+  mutate(observed = TRUE) %>%
+  right_join(s390.os, by=c("subjects", "abx_lag", "continuous")) %>%
+  mutate(observed = coalesce(observed, FALSE)) %>%
+  filter(observed)# %>%
+  # filter(abx_lag %in% c("cefepime", "amoxicillin.clavulanate", "vancomyciniv"))
+
+s390.os3 <- starting_stain_props %>%
+  filter(specimen_type == "Oral Swab") %>%
+  select(-c(specimen_type, study_day)) %>%
+  right_join(d390.os$d5) %>%
+  distinct(subjects, stain, stain_prop) %>%
+  right_join(s390.os1) %>%
+  filter(stain=="GN", abx_lag %in% c("cefepime", "piperacillin.tazobactam", "vancomyciniv")) %>%
+  mutate(abx_lag = fct_recode(
+    as.factor(abx_lag), 
+    "Cefepime"="cefepime",
+    "Piperacillin/Tazobactam"="piperacillin.tazobactam",
+    "Vancomycin (IV)"="vancomyciniv"))
+.pos <- position_dodge(width=0.8)
+ggplot(s390.os3, aes(
+    x=as.factor(continuous), y=difference, ymin=difference.lower, ymax=difference.upper, 
+  color=stain_prop, group=subjects, fill=stain_prop)) +
+  geom_hline(aes(yintercept=1), linetype="dashed") +
+  geom_linerange(position = .pos, alpha=0.7, size=0.8) +
+  geom_line(position=.pos, size=1) +
+  geom_point(position=.pos, shape=21, size=5, color="black") +
+  facet_wrap(vars(abx_lag), scales="free_y") +
+  scale_y_continuous(labels=scales::percent) +
+  scale_size_continuous(guide=F) +
+  scale_color_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 26, barheight = 1)) +
+  scale_fill_gradientn(
+    colours = c("#d7191c", "#fdae61", "#ffffbf", "#abd9e9", "#2c7bb6"),
+    labels=scales::percent,
+    breaks = c(0.1, 0.5, 0.9),
+    guide = guide_colorbar(
+    title.position = "top", title.hjust = 1, barwidth = 12, barheight = 1)) +
+  theme_bw(base_size = 26) +
+  theme(
+    plot.title = element_text(size = 36, face="bold"),
+    legend.position = "bottom", 
+    legend.justification = "right",
+    panel.grid = element_blank(),
+    strip.background = element_rect(fill = "#BEC0BF"),
+    strip.text = element_text(face = "bold")) +
+  labs(
+    title="Oral diversity",
+    y = "Change in diversity with abx", x="Continuous days of antibiotic exposure",
+    color="Gram-negative bacteria at start", fill="Gram-negative bacteria at start")
+ggsave("Oral_Delta_Diversity_GPGN_v3.9.pdf", width=19, height=8)
+```
+
+#### Subject variances
+
+```{r}
+s391.os <- m390.os %>%
+  recover_types(d390.os$d_abx) %>%
+  spread_draws(s_abx2[abx_lag, continuous]) %>%
+  median_qi(.width=c(0.5)) %>%
+  ungroup() %>%
+  mutate(abx_lag=colnames(d390.os$abx)[abx_lag])
+```
+
+```{r}
+.pos <- position_dodge(0.7)
+ggplot(s391.os, aes(as.factor(continuous), s_abx2, color=abx_lag)) +
+  geom_point(position=.pos, size=5) +
+  geom_linerange(position=.pos, aes(ymin=.lower, ymax=.upper), size=1) +
+  scale_color_brewer(palette = "Dark2", type="qual") +
+  theme_bw(base_size = 26) +
+  theme(
+    legend.position = "bottom", legend.title = element_blank()
+    ) +
+  labs(
+    x="Continuous days of antibiotic exposure", 
+    y="Variance of antibiotic coefficient")
+
+ggsave("Oral_Abx_Variances_v3.9.pdf", width=8, height=8)
+```
+
+
+## Model 4.0
+
+I want to explore abx-specific beta terms (e.g. b_abx1) again to better highlight 
+deviations from the group response.
+
